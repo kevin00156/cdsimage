@@ -36,16 +36,19 @@ directory. Match the runtime version to the device version in your project.
 ## Use
 
 ```sh
-./cdsimage up 1 2 3      # three instances, waits until each accepts connections
+./cdsimage up cutter-a cutter-b   # waits until each accepts connections
 ./cdsimage ls
-./cdsimage restart 2     # after a download, or when the demo time runs out
-./cdsimage reset 3       # fresh container and fresh volume
-./cdsimage down 1 2 3
-./cdsimage log 1         # follow the runtime log
+./cdsimage restart cutter-a       # after a download, or when the demo time runs out
+./cdsimage reset cutter-b         # fresh container and fresh volume
+./cdsimage down cutter-a cutter-b
+./cdsimage log cutter-a           # follow the runtime log
 ```
 
-Instance `N` is container `cds-N` with volume `cds-N-data`, and its ports come
-from its number:
+An instance is named by a number (`1`) or a word (`cutter-a`). Instance
+`<name>` is container `cds-<name>` with volume `cds-<name>-data`. A word gets
+the lowest free number on first use and keeps it in
+`~/.config/cdsimage/instances`, so its ports never move. Ports come from the
+number `N`:
 
 | | port |
 |---|---|
@@ -61,9 +64,32 @@ Environment:
 | `CDS_SEED` | none | a directory copied into a fresh instance's state (`/var/opt/codesys`) before it starts: a user database, a boot application |
 | `CDS_IMAGE` | `cdsimage:latest` | image to run |
 
+Put per-host defaults in `~/.config/cdsimage/env` (sourced as shell), for
+example `CDS_BIND=100.64.0.1`, so a later `reset` recreates the instance on
+the same address.
+
 `CDS_USER_MGMT=off` together with `CDS_BIND` on a reachable address means
 anyone who can reach the port can download to the PLC. Keep it on a private
 network.
+
+## Driving it from another machine
+
+Give that machine's key a forced command, so it can manage instances and do
+nothing else on the host (no shell, no Docker):
+
+```
+# ~/.ssh/authorized_keys on the Docker host
+command="/path/to/cdsimage/cdsimage-ssh",restrict ssh-ed25519 AAAA... laptop
+```
+
+```powershell
+ssh <host> restart cutter-a
+ssh <host> ls
+```
+
+`cdsimage-ssh` allows `up`, `restart`, `reset`, `down`, `ls` and `log`. Do
+not hand out Docker access (a `docker context` over SSH) instead: access to
+the Docker daemon is root on the host.
 
 ## Reaching it from the IDE
 

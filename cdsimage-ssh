@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# SSH forced command: lets a key drive instances and nothing else.
+#
+#   ~/.ssh/authorized_keys:
+#   command="/path/to/cdsimage-ssh",restrict ssh-ed25519 AAAA... laptop
+#
+# Then from the other machine:  ssh <host> restart cutter-a
+set -euo pipefail
+read -r -a argv <<< "${SSH_ORIGINAL_COMMAND:-}"
+case ${argv[0]:-} in
+    up|restart|reset|down|ls|log) ;;
+    *) echo "allowed: up|restart|reset|down|ls|log <name>..." >&2; exit 2 ;;
+esac
+exec "$(dirname "$(readlink -f "$0")")/cdsimage" "${argv[@]}"

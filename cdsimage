@@ -1,38 +1,63 @@
 #!/usr/bin/env bash
 # cdsimage — numbered, disposable CODESYS Control for Linux SL instances.
 #
-# Instance N is one container (cds-N) plus one volume (cds-N-data). Ports are
-# derived from N so nothing has to be allocated by hand:
+# An instance has a name (cutter-a, or just 1) and a number N. It is one
+# container (cds-<name>) plus one volume (cds-<name>-data), and its ports come
+# from N so nothing has to be allocated by hand:
 #   runtime  11740+N   (IDE: device address <host>:<port>, or cdsint --port)
 #   gateway  12170+N   (Edge Gateway, when the image has one)
+# A numeric name is its own number. Any other name gets the lowest free number
+# on first use and keeps it in $STATE, so its ports survive down/reset.
 set -euo pipefail
+
+# Per-host defaults (e.g. CDS_BIND=<tailscale ip>), so a later reset or a remote
+# call can't silently recreate an instance on another address.
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/cdsimage
+[ -f "$CONF/env" ] && . "$CONF/env"
 
 IMAGE=${CDS_IMAGE:-cdsimage:latest}
 BIND=${CDS_BIND:-127.0.0.1}          # an unauthenticated PLC: keep it off the LAN unless asked
 USER_MGMT=${CDS_USER_MGMT:-off}      # benches are disposable; see README before turning this on
 SEED=${CDS_SEED:-}                   # optional dir copied into a fresh instance's state
+STATE=${CDS_STATE:-$CONF/instances}   # "name N" per line
 
 usage() {
     cat <<EOF
 usage: cdsimage <command> [args]
 
   build <packages-dir> [version]  build $IMAGE from the .package files in <packages-dir>
-  up <N>...                       start instance N (creates it if needed)
-  restart <N>...                  restart and wait until the runtime accepts connections
-  reset <N>...                    throw instance N away (container + volume) and start it fresh
-  down <N>...                     remove instance N (container + volume)
+  up <name>...                    start an instance (creates it if needed)
+  restart <name>...               restart and wait until the runtime accepts connections
+  reset <name>...                 throw an instance away (container + volume) and start it fresh
+  down <name>...                  remove an instance (container + volume); its number stays reserved
   ls                              list instances and their ports
-  log <N>                         follow the runtime log of instance N
+  log <name>                      follow an instance's runtime log
+
+<name> is a number 1..99 or a name like cutter-a.
 
 env: CDS_IMAGE=$IMAGE CDS_BIND=$BIND CDS_USER_MGMT=$USER_MGMT CDS_SEED=${SEED:-<none>}
 EOF
     exit 2
 }
 
-name() { echo "cds-$1"; }
-
-check_n() {
-    [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 99 )) || { echo "instance must be 1..99, got '$1'" >&2; exit 2; }
+# number <name>: print the instance's number, assigning one on first use
+number() {
+    local name=$1 n
+    [[ $name =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || { echo "bad instance name '$name'" >&2; exit 2; }
+    if [[ $name =~ ^[0-9]+$ ]]; then
+        n=$((10#$name))
+    else
+        mkdir -p "$(dirname "$STATE")"; touch "$STATE"
+        n=$(awk -v k="$name" '$1 == k { print $2 }' "$STATE")
+        if [ -z "$n" ]; then
+            n=1
+            while awk -v n="$n" '$2 == n { f = 1 } END { exit !f }' "$STATE" ||
+                  docker container inspect "cds-$n" >/dev/null 2>&1; do n=$((n + 1)); done
+            echo "$name $n" >> "$STATE"
+        fi
+    fi
+    (( n >= 1 && n <= 99 )) || { echo "instance number must be 1..99, got $n" >&2; exit 2; }
+    echo "$n"
 }
 
 build() {
@@ -47,17 +72,17 @@ build() {
 }
 
 wait_ready() {
-    local n=$1 i
+    local c=$1 i
     for i in $(seq 1 60); do
-        docker exec "$(name "$n")" ss -Hltn 'sport = :11740' 2>/dev/null | grep -q . && return 0
+        docker exec "$c" ss -Hltn 'sport = :11740' 2>/dev/null | grep -q . && return 0
         sleep 1
     done
-    echo "$(name "$n"): runtime not listening after 60 s" >&2
+    echo "$c: runtime not listening after 60 s" >&2
     return 1
 }
 
 up() {
-    local n=$1 c; c=$(name "$n")
+    local c=cds-$1 n; n=$(number "$1")
     if docker container inspect "$c" >/dev/null 2>&1; then
         docker start "$c" >/dev/null
     else
@@ -65,7 +90,7 @@ up() {
         [ -n "$SEED" ] && seed=(-v "$(readlink -f "$SEED")":/seed:ro)
         # --ipc shareable: a sidecar joins with --ipc container:cds-N and sees
         # the same /dev/shm. rtprio lets the non-root runtime use SCHED_FIFO.
-        docker run -d --name "$c" --hostname "$c" --label cdsimage.instance="$n" \
+        docker run -d --name "$c" --hostname "$c" --label cdsimage.instance="$1" \
             --restart unless-stopped --ipc shareable \
             --ulimit rtprio=99 --ulimit memlock=-1 \
             -e CDS_USER_MGMT="$USER_MGMT" \
@@ -73,21 +98,21 @@ up() {
             -v "$c-data:/var/opt/codesys" "${seed[@]}" \
             "$IMAGE" >/dev/null
     fi
-    wait_ready "$n"
+    wait_ready "$c"
     echo "$c up: runtime $BIND:$((11740 + n)), gateway $BIND:$((12170 + n))"
 }
 
 down() {
-    local c; c=$(name "$1")
+    local c=cds-$1
     docker rm -f "$c" >/dev/null 2>&1 || true
     docker volume rm "$c-data" >/dev/null 2>&1 || true
     echo "$c down"
 }
 
 restart() {
-    docker restart "$(name "$1")" >/dev/null
-    wait_ready "$1"
-    echo "$(name "$1") restarted"
+    docker restart "cds-$1" >/dev/null
+    wait_ready "cds-$1"
+    echo "cds-$1 restarted"
 }
 
 ls_() {
@@ -99,11 +124,10 @@ cmd=${1:-}; shift || true
 case $cmd in
     build)   build "$@" ;;
     ls)      ls_ ;;
-    log)     check_n "${1:-}"; docker exec "$(name "$1")" tail -n 50 -F /var/opt/codesys/codesyscontrol.log ;;
+    log)     [ -n "${1:-}" ] || usage; docker exec "cds-$1" tail -n 50 -F /var/opt/codesys/codesyscontrol.log ;;
     up|down|restart|reset)
         [ $# -gt 0 ] || usage
         for n in "$@"; do
-            check_n "$n"
             case $cmd in
                 reset) down "$n"; up "$n" ;;
                 *)     "$cmd" "$n" ;;
