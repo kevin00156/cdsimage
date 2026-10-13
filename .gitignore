@@ -1,0 +1,5 @@
+# CODESYS packages are proprietary: never commit them, even by accident.
+*.package
+*.deb
+*.ipk
+*.rpm

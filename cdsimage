@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# cdsimage — numbered, disposable CODESYS Control for Linux SL instances.
+#
+# Instance N is one container (cds-N) plus one volume (cds-N-data). Ports are
+# derived from N so nothing has to be allocated by hand:
+#   runtime  11740+N   (IDE: device address <host>:<port>, or cdsint --port)
+#   gateway  12170+N   (Edge Gateway, when the image has one)
+set -euo pipefail
+
+IMAGE=${CDS_IMAGE:-cdsimage:latest}
+BIND=${CDS_BIND:-127.0.0.1}          # an unauthenticated PLC: keep it off the LAN unless asked
+USER_MGMT=${CDS_USER_MGMT:-off}      # benches are disposable; see README before turning this on
+SEED=${CDS_SEED:-}                   # optional dir copied into a fresh instance's state
+
+usage() {
+    cat <<EOF
+usage: cdsimage <command> [args]
+
+  build <packages-dir> [version]  build $IMAGE from the .package files in <packages-dir>
+  up <N>...                       start instance N (creates it if needed)
+  restart <N>...                  restart and wait until the runtime accepts connections
+  reset <N>...                    throw instance N away (container + volume) and start it fresh
+  down <N>...                     remove instance N (container + volume)
+  ls                              list instances and their ports
+  log <N>                         follow the runtime log of instance N
+
+env: CDS_IMAGE=$IMAGE CDS_BIND=$BIND CDS_USER_MGMT=$USER_MGMT CDS_SEED=${SEED:-<none>}
+EOF
+    exit 2
+}
+
+name() { echo "cds-$1"; }
+
+check_n() {
+    [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 99 )) || { echo "instance must be 1..99, got '$1'" >&2; exit 2; }
+}
+
+build() {
+    local dir=${1:?packages dir} ver=${2:-}
+    if [ -z "$ver" ]; then
+        # newest "CODESYS Control for Linux SL <ver>.package" in the dir
+        ver=$(ls "$dir" | sed -n 's/^CODESYS Control for Linux SL \(.*\)\.package$/\1/p' | sort -V | tail -1)
+        [ -n "$ver" ] || { echo "no 'CODESYS Control for Linux SL <ver>.package' in $dir" >&2; exit 1; }
+    fi
+    docker build --build-context packages="$dir" --build-arg CDS_VERSION="$ver" \
+        -t "cdsimage:$ver" -t cdsimage:latest "$(dirname "$(readlink -f "$0")")"
+}
+
+wait_ready() {
+    local n=$1 i
+    for i in $(seq 1 60); do
+        docker exec "$(name "$n")" ss -Hltn 'sport = :11740' 2>/dev/null | grep -q . && return 0
+        sleep 1
+    done
+    echo "$(name "$n"): runtime not listening after 60 s" >&2
+    return 1
+}
+
+up() {
+    local n=$1 c; c=$(name "$n")
+    if docker container inspect "$c" >/dev/null 2>&1; then
+        docker start "$c" >/dev/null
+    else
+        local seed=()
+        [ -n "$SEED" ] && seed=(-v "$(readlink -f "$SEED")":/seed:ro)
+        # --ipc shareable: a sidecar joins with --ipc container:cds-N and sees
+        # the same /dev/shm. rtprio lets the non-root runtime use SCHED_FIFO.
+        docker run -d --name "$c" --hostname "$c" --label cdsimage.instance="$n" \
+            --restart unless-stopped --ipc shareable \
+            --ulimit rtprio=99 --ulimit memlock=-1 \
+            -e CDS_USER_MGMT="$USER_MGMT" \
+            -p "$BIND:$((11740 + n)):11740" -p "$BIND:$((12170 + n)):1217" \
+            -v "$c-data:/var/opt/codesys" "${seed[@]}" \
+            "$IMAGE" >/dev/null
+    fi
+    wait_ready "$n"
+    echo "$c up: runtime $BIND:$((11740 + n)), gateway $BIND:$((12170 + n))"
+}
+
+down() {
+    local c; c=$(name "$1")
+    docker rm -f "$c" >/dev/null 2>&1 || true
+    docker volume rm "$c-data" >/dev/null 2>&1 || true
+    echo "$c down"
+}
+
+restart() {
+    docker restart "$(name "$1")" >/dev/null
+    wait_ready "$1"
+    echo "$(name "$1") restarted"
+}
+
+ls_() {
+    docker ps -a --filter label=cdsimage.instance \
+        --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}'
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+    build)   build "$@" ;;
+    ls)      ls_ ;;
+    log)     check_n "${1:-}"; docker exec "$(name "$1")" tail -n 50 -F /var/opt/codesys/codesyscontrol.log ;;
+    up|down|restart|reset)
+        [ $# -gt 0 ] || usage
+        for n in "$@"; do
+            check_n "$n"
+            case $cmd in
+                reset) down "$n"; up "$n" ;;
+                *)     "$cmd" "$n" ;;
+            esac
+        done ;;
+    *) usage ;;
+esac
