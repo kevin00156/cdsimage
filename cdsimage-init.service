@@ -1,0 +1,13 @@
+[Unit]
+Description=cdsimage per-boot setup (host key, seed, runtime config)
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service codesyscontrol.service codesysedge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cdsimage-init
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

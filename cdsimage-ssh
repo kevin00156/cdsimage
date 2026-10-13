@@ -7,15 +7,8 @@
 # Then from the other machine:  ssh <host> restart cutter-a
 set -euo pipefail
 read -r -a argv <<< "${SSH_ORIGINAL_COMMAND:-}"
-cmd=${argv[0]:-}
-case $cmd in
-    up|restart|reset|down|ls|log|claim|release)
-        exec "$(dirname "$(readlink -f "$0")")/cdsimage" "${argv[@]}" ;;
+case ${argv[0]:-} in
+    up|restart|reset|down|ls|log|claim|release) ;;
+    *) echo "allowed: up|restart|reset|down|ls|log|claim|release ..." >&2; exit 2 ;;
 esac
-# host-local extensions: ~/.config/cdsimage/ssh.d/<cmd>
-ext=${XDG_CONFIG_HOME:-$HOME/.config}/cdsimage/ssh.d
-if [[ $cmd =~ ^[a-z][a-z0-9-]*$ ]] && [ -x "$ext/$cmd" ]; then
-    exec "$ext/$cmd" "${argv[@]:1}"
-fi
-echo "allowed: up|restart|reset|down|ls|log|claim|release ...$(ls "$ext" 2>/dev/null | sed 's/^/ | /' | tr -d '\n')" >&2
-exit 2
+exec "$(dirname "$(readlink -f "$0")")/cdsimage" "${argv[@]}"

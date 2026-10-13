@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# cdsimage — numbered, disposable CODESYS Control for Linux SL instances.
+# cdsimage — numbered, disposable CODESYS Control for Linux SL machines.
 #
-# An instance has a name (cutter-a, or just 1) and a number N. It is one
-# container (cds-<name>) plus one volume (cds-<name>-data), and its ports come
-# from N so nothing has to be allocated by hand:
+# An instance is a container that behaves like a small controller: systemd,
+# codesyscontrol.service, sshd, a `plc` account with passwordless sudo. Deploy
+# to it the way you deploy to the real one.
+#
+# It has a name (cutter-a, or just 1) and a number N. It is one container
+# (cds-<name>) plus one volume (cds-<name>-data), and its ports come from N so
+# nothing has to be allocated by hand:
+#   ssh      2200+N    (user plc, keys from $AUTH_KEYS)
 #   runtime  11740+N   (IDE: device address <host>:<port>, or cdsint --port)
 #   gateway  12170+N   (Edge Gateway, when the image has one)
 # A numeric name is its own number. Any other name gets the lowest free number
-# on first use and keeps it in $STATE, so its ports survive down/reset.
-#
-# Host-local extensions, so whatever runs beside a PLC stays out of this repo:
-#   $CONF/hooks.d/*  run after up/restart/reset/down as: <hook> <event> <name> <N>
-#                    (a restart gives the PLC a fresh /dev/shm, so a companion
-#                    process has to be recreated after it; a hook does that)
-#   $CONF/ssh.d/<cmd>  extra commands for cdsimage-ssh, stdin passed through
+# on first use and keeps it in $STATE, so its ports survive down/reset; so does
+# its ssh host key ($CONF/hostkeys/<name>).
 set -euo pipefail
 
 # Per-host defaults (e.g. CDS_BIND=<tailscale ip>), so a later reset or a remote
@@ -26,6 +26,7 @@ BIND=${CDS_BIND:-127.0.0.1}          # an unauthenticated PLC: keep it off the L
 USER_MGMT=${CDS_USER_MGMT:-off}      # benches are disposable; see README before turning this on
 SEED=${CDS_SEED:-}                   # optional dir copied into a fresh instance's state
 STATE=${CDS_STATE:-$CONF/instances}   # "name N" per line
+AUTH_KEYS=${CDS_AUTHORIZED_KEYS:-$CONF/authorized_keys}   # who may ssh in as plc
 CLAIMS=$CONF/claims                  # one file per claimed instance: "<owner> <epoch>"
 CLAIM_TTL=${CDS_CLAIM_TTL:-14400}    # a claim nobody renews is free again after this (s)
 
@@ -35,8 +36,8 @@ usage: cdsimage <command> [args]
 
   build <packages-dir> [version]  build $IMAGE from the .package files in <packages-dir>
   up <name>...                    start an instance (creates it if needed)
-  restart <name>...               restart and wait until the runtime accepts connections
-  reset <name>...                 throw an instance away (container + volume) and start it fresh
+  restart <name>...               reboot it and wait until the runtime accepts connections
+  reset <name>...                 throw an instance away (container + volume): a fresh machine
   down <name>...                  remove an instance (container + volume); its number stays reserved
   ls                              list instances, their ports and who holds them
   claim <name|prefix-> <owner>    hold an instance for <owner>; a prefix ending in "-"
@@ -44,10 +45,10 @@ usage: cdsimage <command> [args]
   release <name> <owner>          let go of it
   log <name>                      follow an instance's runtime log
 
-<name> is a number 1..99 or a name like cutter-a. Hooks in $CONF/hooks.d run
-after up/restart/reset/down.
+<name> is a number 1..99 or a name like cutter-a.
 
 env: CDS_IMAGE=$IMAGE CDS_BIND=$BIND CDS_USER_MGMT=$USER_MGMT CDS_SEED=${SEED:-<none>}
+     CDS_AUTHORIZED_KEYS=$AUTH_KEYS
 EOF
     exit 2
 }
@@ -98,20 +99,25 @@ up() {
     if docker container inspect "$c" >/dev/null 2>&1; then
         docker start "$c" >/dev/null
     else
-        local seed=()
-        [ -n "$SEED" ] && seed=(-v "$(readlink -f "$SEED")":/seed:ro)
-        # --ipc shareable: a sidecar joins with --ipc container:cds-N and sees
-        # the same /dev/shm. rtprio lets the non-root runtime use SCHED_FIFO.
+        local mounts=(-v "$c-data:/var/opt/codesys" -v "$CONF/hostkeys/$1:/etc/ssh/hostkeys")
+        mkdir -p "$CONF/hostkeys/$1"
+        [ -f "$AUTH_KEYS" ] && mounts+=(-v "$(readlink -f "$AUTH_KEYS")":/etc/cdsimage/authorized_keys:ro)
+        [ -n "$SEED" ] && mounts+=(-v "$(readlink -f "$SEED")":/seed:ro)
+        # systemd as PID 1: its own writable cgroup namespace (no host cgroup
+        # tree, no --privileged) and a tmpfs /run. SYS_NICE + rtprio for the
+        # runtime's SCHED_FIFO tasks.
         docker run -d --name "$c" --hostname "$c" --label cdsimage.instance="$1" \
-            --restart unless-stopped --ipc shareable \
-            --ulimit rtprio=99 --ulimit memlock=-1 \
+            --restart unless-stopped \
+            --cgroupns private --security-opt writable-cgroups=true \
+            --tmpfs /run --tmpfs /run/lock \
+            --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit rtprio=99 --ulimit memlock=-1 \
             -e CDS_USER_MGMT="$USER_MGMT" \
+            -p "$BIND:$((2200 + n)):22" \
             -p "$BIND:$((11740 + n)):11740" -p "$BIND:$((12170 + n)):1217" \
-            -v "$c-data:/var/opt/codesys" "${seed[@]}" \
-            "$IMAGE" >/dev/null
+            "${mounts[@]}" "$IMAGE" >/dev/null
     fi
     wait_ready "$c"
-    echo "$c up: runtime $BIND:$((11740 + n)), gateway $BIND:$((12170 + n))"
+    echo "$c up: ssh plc@$BIND -p $((2200 + n)), runtime $BIND:$((11740 + n)), gateway $BIND:$((12170 + n))"
 }
 
 down() {
@@ -125,16 +131,6 @@ restart() {
     docker restart "cds-$1" >/dev/null
     wait_ready "cds-$1"
     echo "cds-$1 restarted"
-}
-
-# hooks <event> <name> <N>: run every executable in hooks.d, in name order
-hooks() {
-    local h rc=0
-    for h in "$CONF"/hooks.d/*; do
-        [ -x "$h" ] || continue
-        "$h" "$@" || { echo "hook $(basename "$h") failed on $1 $2" >&2; rc=1; }
-    done
-    return $rc
 }
 
 ls_() {
@@ -190,14 +186,11 @@ case $cmd in
     log)     [ -n "${1:-}" ] || usage; docker exec "cds-$1" tail -n 50 -F /var/opt/codesys/codesyscontrol.log ;;
     up|down|restart|reset)
         [ $# -gt 0 ] || usage
-        rc=0
         for n in "$@"; do
             case $cmd in
                 reset) down "$n"; up "$n" ;;
                 *)     "$cmd" "$n" ;;
             esac
-            hooks "$cmd" "$n" "$(number "$n")" || rc=1
-        done
-        exit $rc ;;
+        done ;;
     *) usage ;;
 esac

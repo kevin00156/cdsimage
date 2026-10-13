@@ -1,0 +1,31 @@
+#!/bin/bash
+# Runs once per boot, before sshd and the runtime. Services don't inherit the
+# container's environment, so the CDS_* settings are read from PID 1's.
+set -e
+while IFS= read -r -d '' kv; do
+    case $kv in CDS_*=*) export "${kv?}" ;; esac
+done < /proc/1/environ
+
+# sshd host key: /etc/ssh/hostkeys is a per-instance mount from the host; make
+# one the first time.
+mkdir -p /etc/ssh/hostkeys
+[ -f /etc/ssh/hostkeys/ssh_host_ed25519_key ] ||
+    ssh-keygen -q -t ed25519 -N '' -C "$(hostname)" -f /etc/ssh/hostkeys/ssh_host_ed25519_key
+
+# /seed (optional, read-only mount) is copied into the runtime's state dir on a
+# fresh volume only: a user database, a boot application, anything that should
+# be there before the first login. An existing volume is never overwritten.
+if [ -d /seed ] && [ ! -e /var/opt/codesys/.seeded ]; then
+    cp -a /seed/. /var/opt/codesys/
+    touch /var/opt/codesys/.seeded
+fi
+
+# CDS_USER_MGMT=off: no forced user management, so a disposable bench can be
+# logged into and downloaded to without first creating an account in the IDE.
+# The shipped file has no [CmpUserMgr] section until the runtime first writes
+# one, so add the section when it is missing.
+cfg=/etc/codesyscontrol/CODESYSControl_User.cfg
+if [ "${CDS_USER_MGMT:-on}" = off ] && ! grep -q '^SECURITY.UserMgmtEnforce=' "$cfg"; then
+    grep -q '^\[CmpUserMgr\]' "$cfg" || printf '\n[CmpUserMgr]\n' >> "$cfg"
+    sed -i '/^\[CmpUserMgr\]/a SECURITY.UserMgmtEnforce=NO' "$cfg"
+fi
