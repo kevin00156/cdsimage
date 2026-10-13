@@ -8,6 +8,12 @@
 #   gateway  12170+N   (Edge Gateway, when the image has one)
 # A numeric name is its own number. Any other name gets the lowest free number
 # on first use and keeps it in $STATE, so its ports survive down/reset.
+#
+# Host-local extensions, so whatever runs beside a PLC stays out of this repo:
+#   $CONF/hooks.d/*  run after up/restart/reset/down as: <hook> <event> <name> <N>
+#                    (a restart gives the PLC a fresh /dev/shm, so a companion
+#                    process has to be recreated after it; a hook does that)
+#   $CONF/ssh.d/<cmd>  extra commands for cdsimage-ssh, stdin passed through
 set -euo pipefail
 
 # Per-host defaults (e.g. CDS_BIND=<tailscale ip>), so a later reset or a remote
@@ -20,6 +26,8 @@ BIND=${CDS_BIND:-127.0.0.1}          # an unauthenticated PLC: keep it off the L
 USER_MGMT=${CDS_USER_MGMT:-off}      # benches are disposable; see README before turning this on
 SEED=${CDS_SEED:-}                   # optional dir copied into a fresh instance's state
 STATE=${CDS_STATE:-$CONF/instances}   # "name N" per line
+CLAIMS=$CONF/claims                  # one file per claimed instance: "<owner> <epoch>"
+CLAIM_TTL=${CDS_CLAIM_TTL:-14400}    # a claim nobody renews is free again after this (s)
 
 usage() {
     cat <<EOF
@@ -30,10 +38,14 @@ usage: cdsimage <command> [args]
   restart <name>...               restart and wait until the runtime accepts connections
   reset <name>...                 throw an instance away (container + volume) and start it fresh
   down <name>...                  remove an instance (container + volume); its number stays reserved
-  ls                              list instances and their ports
+  ls                              list instances, their ports and who holds them
+  claim <name|prefix-> <owner>    hold an instance for <owner>; a prefix ending in "-"
+                                  takes the first free one that matches; prints its name
+  release <name> <owner>          let go of it
   log <name>                      follow an instance's runtime log
 
-<name> is a number 1..99 or a name like cutter-a.
+<name> is a number 1..99 or a name like cutter-a. Hooks in $CONF/hooks.d run
+after up/restart/reset/down.
 
 env: CDS_IMAGE=$IMAGE CDS_BIND=$BIND CDS_USER_MGMT=$USER_MGMT CDS_SEED=${SEED:-<none>}
 EOF
@@ -115,23 +127,77 @@ restart() {
     echo "cds-$1 restarted"
 }
 
+# hooks <event> <name> <N>: run every executable in hooks.d, in name order
+hooks() {
+    local h rc=0
+    for h in "$CONF"/hooks.d/*; do
+        [ -x "$h" ] || continue
+        "$h" "$@" || { echo "hook $(basename "$h") failed on $1 $2" >&2; rc=1; }
+    done
+    return $rc
+}
+
 ls_() {
     docker ps -a --filter label=cdsimage.instance \
         --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}'
+    local f
+    for f in "$CLAIMS"/*; do
+        [ -f "$f" ] && holder "$(basename "$f")" >/dev/null &&
+            echo "claimed: $(basename "$f") by $(holder "$(basename "$f")")"
+    done
+    return 0
+}
+
+# holder <name>: print who holds a live claim on it; fails if nobody does
+holder() {
+    local owner t
+    read -r owner t 2>/dev/null < "$CLAIMS/$1" || return 1
+    (( $(date +%s) - t < CLAIM_TTL )) || return 1
+    echo "$owner"
+}
+
+# claim <name|prefix-> <owner>: claiming again as the same owner renews it
+claim() {
+    local want=$1 owner=$2 c name h
+    [[ $owner =~ ^[A-Za-z0-9_.@-]+$ ]] || { echo "bad owner '$owner'" >&2; exit 2; }
+    mkdir -p "$CLAIMS"
+    exec 9>"$CLAIMS/.lock"; flock 9
+    for c in $(docker ps --filter label=cdsimage.instance --format '{{.Names}}' | sort); do
+        name=${c#cds-}
+        [[ $want == *- ]] && [[ $name == "$want"* ]] || [ "$name" = "$want" ] || continue
+        if h=$(holder "$name") && [ "$h" != "$owner" ]; then continue; fi
+        echo "$owner $(date +%s)" > "$CLAIMS/$name"
+        echo "$name"
+        return 0
+    done
+    echo "no free running instance matches '$want'" >&2
+    exit 1
+}
+
+release() {
+    local h
+    if h=$(holder "$1") && [ "$h" != "$2" ]; then echo "$1 is held by $h, not $2" >&2; exit 1; fi
+    rm -f "$CLAIMS/$1"
+    echo "$1 released"
 }
 
 cmd=${1:-}; shift || true
 case $cmd in
     build)   build "$@" ;;
     ls)      ls_ ;;
+    claim)   [ $# -eq 2 ] || usage; claim "$1" "$2" ;;
+    release) [ $# -eq 2 ] || usage; release "$1" "$2" ;;
     log)     [ -n "${1:-}" ] || usage; docker exec "cds-$1" tail -n 50 -F /var/opt/codesys/codesyscontrol.log ;;
     up|down|restart|reset)
         [ $# -gt 0 ] || usage
+        rc=0
         for n in "$@"; do
             case $cmd in
                 reset) down "$n"; up "$n" ;;
                 *)     "$cmd" "$n" ;;
             esac
-        done ;;
+            hooks "$cmd" "$n" "$(number "$n")" || rc=1
+        done
+        exit $rc ;;
     *) usage ;;
 esac

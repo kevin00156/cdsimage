@@ -72,6 +72,34 @@ the same address.
 anyone who can reach the port can download to the PLC. Keep it on a private
 network.
 
+## Sharing instances between parallel jobs
+
+A job holds an instance while it uses it, so two jobs never download onto the
+same PLC:
+
+```sh
+bench=$(./cdsimage claim cutter- job-42)   # first free cutter-*, prints its name
+./cdsimage restart "$bench"                 # fresh runtime, fresh 2 h demo clock
+# ... download, test ...
+./cdsimage release "$bench" job-42
+```
+
+Claiming again as the same owner renews the claim. A claim nobody renews
+expires after `CDS_CLAIM_TTL` seconds (default 4 h), so a job that died does
+not hold an instance forever. `ls` shows who holds what.
+
+## Extending it on the host
+
+What runs beside a PLC is yours, not this repo's. Two directories under
+`~/.config/cdsimage/` take executables:
+
+- `hooks.d/*` run after `up`, `restart`, `reset` and `down` as
+  `<hook> <event> <name> <N>`. A restart gives the PLC a fresh `/dev/shm`, so a
+  companion container (see below) has to be recreated after it; a hook does
+  that, and nobody has to remember the order.
+- `ssh.d/<cmd>` become extra commands for `cdsimage-ssh`, with stdin passed
+  through (handy for shipping a binary: `gzip -c app | ssh <host> mycmd deploy 1`).
+
 ## Driving it from another machine
 
 Give that machine's key a forced command, so it can manage instances and do
@@ -87,7 +115,8 @@ ssh <host> restart cutter-a
 ssh <host> ls
 ```
 
-`cdsimage-ssh` allows `up`, `restart`, `reset`, `down`, `ls` and `log`. Do
+`cdsimage-ssh` allows `up`, `restart`, `reset`, `down`, `ls`, `log`, `claim`,
+`release` and whatever is in `ssh.d/`. Do
 not hand out Docker access (a `docker context` over SSH) instead: access to
 the Docker daemon is root on the host.
 
